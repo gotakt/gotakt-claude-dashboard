@@ -3,8 +3,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/maroxd3/gotakt-claude-dashboard/actions/workflows/pruefung.yml">
-    <img src="https://github.com/maroxd3/gotakt-claude-dashboard/actions/workflows/pruefung.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/gotakt/gotakt-claude-dashboard/actions/workflows/pruefung.yml">
+    <img src="https://github.com/gotakt/gotakt-claude-dashboard/actions/workflows/pruefung.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/tests-63-3DDC84" alt="63 tests">
   <img src="https://img.shields.io/badge/dependencies-none-5B8DEF" alt="no dependencies">
   <img src="https://img.shields.io/badge/python-3.9%20%7C%203.11%20%7C%203.13-C084FC" alt="Python">
@@ -58,7 +58,7 @@ modification time. Every card says which of the two it used: **HOOK** or **herge
 ## Install
 
 ```bash
-git clone https://github.com/maroxd3/gotakt-claude-dashboard.git
+git clone https://github.com/gotakt/gotakt-claude-dashboard.git
 cd gotakt-claude-dashboard
 ./install.sh
 ```
