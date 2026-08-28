@@ -375,7 +375,8 @@ def collect(mit_erledigt=False):
                     sessions.append(s)
                 except Exception as e:
                     print("uebersprungen: %s (%s)" % (f, e), file=sys.stderr)
-    _sichere(CACHE, cache)
+    with SPERRE:
+        _sichere(CACHE, cache)
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     if DEMO:
         sessions = [_anonym(x, i) for i, x in enumerate(sessions)]
@@ -634,30 +635,44 @@ def melde(titel, untertitel, text):
          % (esc(text), esc(titel), esc(untertitel)))
 
 
+def eskalation_merken(faellig):
+    """Nur das Feld eskaliert zusammenfuehren, nichts anderes ueberschreiben."""
+    if not faellig:
+        return
+    with SPERRE:
+        z = zustand_laden()
+        z["eskaliert"].update(faellig)
+        _sichere(STATE, z)
+
+
 def eskalation_schleife(intervall=300, schwelle=3600):
-    """Meldet nochmal, wenn etwas laenger als eine Stunde wartet."""
+    """Meldet nochmal, wenn etwas laenger als eine Stunde wartet.
+
+    Die Sperre wird bewusst nicht ueber collect() oder die Mitteilung gehalten.
+    Erst wird ermittelt, was faellig ist, dann wird der Zustand frisch geladen
+    und nur das Feld eskaliert zusammengefuehrt. Sonst wuerde diese Schleife
+    Aenderungen ueberschreiben, die waehrenddessen ueber HTTP passiert sind.
+    """
     while True:
         try:
             time.sleep(intervall)
-            z = zustand_laden()
+            with SPERRE:
+                bekannt = dict(zustand_laden()["eskaliert"])
             jetzt = datetime.datetime.now().timestamp()
-            geaendert = False
+            faellig = {}
             for s in collect():
                 if status(s)[0] != "warte":
                     continue
                 wartet = jetzt - s["mtime"]
                 if wartet < schwelle or wartet > 86400:
                     continue
-                letzte = z["eskaliert"].get(s["id"], 0)
-                if jetzt - letzte < schwelle:
+                if jetzt - bekannt.get(s["id"], 0) < schwelle:
                     continue
                 melde("%d Std ohne Antwort" % int(wartet // 3600),
                       os.path.basename((s["cwd"] or "?").rstrip("/")),
                       s.get("title") or "Sitzung")
-                z["eskaliert"][s["id"]] = jetzt
-                geaendert = True
-            if geaendert:
-                _sichere(STATE, z)
+                faellig[s["id"]] = jetzt
+            eskalation_merken(faellig)
         except Exception as ex:
             warn("Eskalationsschleife: %s" % ex)
 
@@ -916,9 +931,13 @@ function hole(pfad, cb, koerper){
 }
 
 // ---- Entwuerfe ueberleben jedes Neuladen ----
+// sessionStorage statt localStorage: Entwuerfe sollen ein Neuladen ueberleben,
+// aber nicht tage- oder wochenlang unter dieser Origin liegenbleiben.
 function entwurfSchluessel(sid){ return 'entwurf:' + sid; }
-function entwurfLesen(sid){ try { return localStorage.getItem(entwurfSchluessel(sid)) || ''; } catch(e){ return ''; } }
-function entwurfSchreiben(sid, t){ try { t ? localStorage.setItem(entwurfSchluessel(sid), t) : localStorage.removeItem(entwurfSchluessel(sid)); } catch(e){} }
+function entwurfLesen(sid){ try { return sessionStorage.getItem(entwurfSchluessel(sid)) || ''; } catch(e){ return ''; } }
+function entwurfSchreiben(sid, t){ try { t ? sessionStorage.setItem(entwurfSchluessel(sid), t) : sessionStorage.removeItem(entwurfSchluessel(sid)); } catch(e){} }
+// Altlasten aus frueheren Fassungen einmalig wegraeumen.
+try { Object.keys(localStorage).forEach(function(k){ if(k.indexOf('entwurf:') === 0) localStorage.removeItem(k); }); } catch(e){}
 
 document.querySelectorAll('.karte').forEach(function(k){
   var sid = k.getAttribute('data-sid');
@@ -1215,7 +1234,8 @@ def build(sessions, platz=0, archiv=False):
     p.append("<div class='zustandspille'><i></i><div>"
              "<div class='a'>%d warten</div><div class='b'>%d aktiv, %d abgebrochen</div>"
              "</div></div>" % (n_warte, n_live, n_tot))
-    p.append("<button class='haupt-knopf' data-neu='1'>+ Neue Session</button>")
+    if not NUR_LESEN:
+        p.append("<button class='haupt-knopf' data-neu='1'>+ Neue Session</button>")
     p.append("<button class='rundknopf' id='neuladen' title='Neu laden'>&#8635;</button>")
     p.append("<div class='avatar'>MS</div>")
     p.append("</header><div class='inhalt'>")
@@ -1260,10 +1280,11 @@ def build(sessions, platz=0, archiv=False):
 
     def budgetteil(label, verbraucht, budget, zeitraum):
         if budget <= 0:
+            link = ("" if NUR_LESEN else
+                    "<div class='budgetlink' data-dialog='1'>Budget festlegen &rsaquo;</div>")
             return ("<div class='mini'><div class='l'>%s</div>"
                     "<div class='w'>%s <small>kein Budget gesetzt</small></div>"
-                    "<div class='budgetlink' data-dialog='1'>Budget festlegen &rsaquo;</div></div>"
-                    % (e(label), e(_geld(verbraucht))))
+                    "%s</div>" % (e(label), e(_geld(verbraucht)), link))
         anteil = verbraucht / budget
         rest = budget - verbraucht
         farbe = _budgetfarbe(anteil)
@@ -1355,8 +1376,10 @@ def build(sessions, platz=0, archiv=False):
                 if k == "kalt":
                     p.append("<button class='wz' data-art='papierkorb'>&#9003;</button>")
             p.append("</div></div></article>")
-        p.append("</div><div class='sp-fuss'><button data-neu='1'>+ Neue Session</button>"
-                 "</div></section>")
+        p.append("</div>")
+        if not NUR_LESEN:
+            p.append("<div class='sp-fuss'><button data-neu='1'>+ Neue Session</button></div>")
+        p.append("</section>")
     p.append("</div>")
 
     p.append("</div></div>")
@@ -1382,14 +1405,18 @@ def build(sessions, platz=0, archiv=False):
     p.append("<p>Anthropic speichert das verbleibende Kontingent nicht auf deinem Rechner, "
              "es kommt beim Aufruf von <b>/usage</b> vom Server. Deshalb rechnet das Dashboard "
              "gegen ein Budget, das du selbst setzt. 0 schaltet die Anzeige ab.</p>")
+    if NUR_LESEN:
+        p.append("<p>Budget aendern geht nur mit laufendem Server.</p>")
     p.append("<div class='budgetfeld'><label>Pro Tag</label>"
              "<input id='b_tag' type='number' step='1' min='0' value='%s'><span>$</span></div>"
              % ("%.0f" % b_tag))
     p.append("<div class='budgetfeld'><label>Pro Woche</label>"
              "<input id='b_woche' type='number' step='1' min='0' value='%s'><span>$</span></div>"
              % ("%.0f" % b_woche))
-    p.append("<div class='knoepfe'><button class='knopf' id='b_speichern'>Budget sichern</button>"
-             "<button class='knopf' id='zu'>Schliessen</button></div>")
+    p.append("<div class='knoepfe'>")
+    if not NUR_LESEN:
+        p.append("<button class='knopf' id='b_speichern'>Budget sichern</button>")
+    p.append("<button class='knopf' id='zu'>Schliessen</button></div>")
     p.append("</div></div>")
 
     p.append("<div class='pille'><span style='color:var(--lila)'>&#10022;</span>"
@@ -1529,6 +1556,16 @@ def serve(port=8787):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy",
+                             "default-src 'none'; "
+                             "script-src 'unsafe-inline'; "
+                             "style-src 'unsafe-inline'; "
+                             "connect-src 'self'; "
+                             "img-src 'self' data:; "
+                             "frame-ancestors 'none'; "
+                             "base-uri 'none'; "
+                             "form-action 'none'")
             self.end_headers()
             self.wfile.write(body)
 

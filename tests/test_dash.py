@@ -116,6 +116,56 @@ class Preise(unittest.TestCase):
         self.assertAlmostEqual(k, d.PREISE["opus"]["in"], places=6)
 
 
+class Nebenlaeufigkeit(unittest.TestCase):
+    """Die Eskalationsschleife darf parallele Aenderungen nicht ueberschreiben."""
+
+    def setUp(self):
+        self.alt = d.STATE
+        d.STATE = tempfile.mktemp(suffix=".json")
+
+    def tearDown(self):
+        d.STATE = self.alt
+
+    def test_eskalation_ueberschreibt_erledigt_nicht(self):
+        # Ausgangslage wie sie die Schleife zu Beginn liest
+        d.erledigt_setzen("alt", True)
+        veraltet = d.zustand_laden()
+        # waehrenddessen archiviert jemand ueber HTTP
+        d.erledigt_setzen("neu", True)
+        # jetzt merkt sich die Schleife ihre Eskalation
+        d.eskalation_merken({"sitzung-1": 1234.0})
+        jetzt = d.zustand_laden()
+        self.assertIn("neu", jetzt["erledigt"], "parallele Archivierung ging verloren")
+        self.assertIn("alt", jetzt["erledigt"])
+        self.assertEqual(jetzt["eskaliert"]["sitzung-1"], 1234.0)
+        self.assertNotIn("sitzung-1", veraltet["eskaliert"])
+
+    def test_leere_eskalation_schreibt_nicht(self):
+        d.erledigt_setzen("x", True)
+        d.eskalation_merken({})
+        self.assertIn("x", d.zustand_laden()["erledigt"])
+
+
+class Kopfzeilen(unittest.TestCase):
+    def test_seite_meldet_keinen_dauerspeicher(self):
+        html = d.build([], 0)
+        self.assertNotIn("localStorage.setItem", html)
+        self.assertIn("sessionStorage", html)
+
+
+class NurLesen(unittest.TestCase):
+    def test_statischer_bau_ohne_mutierende_knoepfe(self):
+        alt = d.NUR_LESEN
+        d.NUR_LESEN = True
+        try:
+            html = d.build([], 0)
+            self.assertNotIn("data-neu='1'", html)
+            self.assertNotIn("id='b_speichern'", html)
+            self.assertIn("data-nurlesen='1'", html)
+        finally:
+            d.NUR_LESEN = alt
+
+
 class Zeit(unittest.TestCase):
     def test_utc_wird_ortszeit(self):
         self.assertEqual(len(d._ortstag("2026-08-27T23:30:00.000Z")), 10)
