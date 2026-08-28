@@ -78,6 +78,10 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 
 echo
+echo "Hooks eintragen ..."
+"$PY" "$REPO/hooks/install-hooks.py" || echo "Hooks nicht eingetragen, Dashboard laeuft trotzdem."
+
+echo
 echo "Installiert. Das Dashboard laeuft auf http://localhost:$PORT"
 echo "Protokolle : $REPO/logs/"
 echo "Entfernen  : launchctl bootout gui/\$(id -u)/$LABEL && rm $PLIST"

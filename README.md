@@ -14,9 +14,25 @@ had stopped.
 
 ## What it does
 
-Every session lands in one of four states. These are **inferred** from the transcript
-file: who spoke last, and when the file last changed. A session running a long command
-without writing to the transcript can therefore look aborted.
+Session state comes from **Claude Code hooks** when they are installed, and falls back
+to the transcript file when they are not.
+
+| State | Comes from |
+|---|---|
+| **Braucht Freigabe** | `PermissionRequest`: Claude is waiting for you to approve a tool |
+| **Läuft gerade** | `UserPromptSubmit` / `PreToolUse`, with the tool name shown |
+| **Wartet auf dich** | `Stop`: Claude finished its turn |
+| **Abgebrochen** | `StopFailure`, or the transcript's last message is yours |
+| **Kalt** | `SessionEnd`, or nothing happened for over a week |
+
+Each card carries a small marker: **HOOK** when the state was reported by a hook,
+**hergeleitet** when it was inferred from the transcript.
+
+Hooks can go missing after a crash or `SIGKILL`, so every reported state has a shelf
+life. `arbeitet` is trusted for 20 minutes, `freigabe` for two hours, `wartet` for a
+week, and `beendet` forever. Past that the dashboard falls back to the old heuristic
+rather than showing a session as running for eternity. The rule is documented in
+`HALTBAR` in `dash.py`.
 
 | State | Meaning |
 |---|---|
@@ -103,6 +119,36 @@ if it dies.
 ```bash
 launchctl bootout gui/$(id -u)/de.gotakt.claude-dashboard
 rm ~/Library/LaunchAgents/de.gotakt.claude-dashboard.plist
+```
+
+## Lifecycle hooks
+
+`./install.sh` also registers a hook on nine events: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+`PermissionRequest`, `Stop`, `StopFailure` and `SessionEnd`.
+
+`hooks/lifecycle.py` is an observer. It never changes what Claude Code does, makes no
+network calls and always exits 0. It writes one small file per session to
+`~/.claude/dashboard/lifecycle/`:
+
+```json
+{
+  "session_id": "...", "cwd": "...", "state": "arbeitet",
+  "last_event": "PreToolUse", "last_event_at": "...",
+  "current_tool": "Bash", "started_at": "...", "ended_at": null
+}
+```
+
+**Prompts, tool inputs and tool results are deliberately not stored.** The transcript
+is already the one copy of that; a second one would only be another place to leak
+from. The hook strips those fields even if a future event carries them.
+
+Installing is safe to repeat: existing settings and third-party hooks are preserved, a
+backup is written first, and an invalid `settings.json` aborts the install instead of
+being guessed at. To register the hooks without touching anything else:
+
+```bash
+python3 hooks/install-hooks.py
 ```
 
 ## Get notified instead of checking

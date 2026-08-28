@@ -13,6 +13,7 @@ import os, sys, json, html, subprocess, datetime, re, shlex, threading, time, se
 ROOT   = os.path.expanduser("~/.claude/projects")
 DATEN  = os.path.expanduser("~/.claude/dashboard")
 PAPIER = os.path.expanduser("~/.claude/projects/_papierkorb")
+LEBEN  = os.path.expanduser("~/.claude/dashboard/lifecycle")
 OUT    = os.path.join(DATEN, "index.html")
 CACHE  = os.path.join(DATEN, "cache.json")
 CACHE_V = 3
@@ -313,17 +314,103 @@ def kurz(p):
     return "~" + p[len(home):] if p and p.startswith(home) else (p or "unbekannt")
 
 
-def status(inf):
+# Wie lange ein per Hook gemeldeter Zustand als aktuell gilt.
+#
+# Hooks koennen ausbleiben: harter Absturz, SIGKILL, Stromausfall. Ein einmal
+# gemeldetes "arbeitet" wuerde sonst fuer immer als LAEUFT stehenbleiben, also
+# genau die Falschmeldung, die wir loswerden wollten. Deshalb bekommt jeder
+# Zustand eine Haltbarkeit. Danach faellt die Anzeige auf die Herleitung aus
+# Transkript und Aenderungszeit zurueck.
+#
+# arbeitet  20 Min   ein einzelner Werkzeugaufruf dauert selten laenger
+# freigabe   2 Std   ein Freigabedialog darf lange offen stehen, das ist der Fall,
+#                    den wir gerade sichtbar machen wollen
+# wartet     7 Tage  deckt sich mit der Grenze, ab der eine Sitzung kalt heisst
+# bereit    10 Min   Sitzung gestartet, aber noch nichts passiert: schwaches Signal
+# beendet    immer   ein Ende bleibt ein Ende
+# fehler     2 Std   Turn abgebrochen, danach lieber wieder herleiten
+HALTBAR = {
+    "arbeitet": 20 * 60,
+    "freigabe": 2 * 3600,
+    "wartet":   7 * 86400,
+    "bereit":   10 * 60,
+    "fehler":   2 * 3600,
+    "beendet":  None,
+}
+
+# Zustand aus dem Hook -> (Spalte, Beschriftung, Rang)
+LEBEN_ZU_SPALTE = {
+    "freigabe": ("freigabe", "BRAUCHT FREIGABE", 0),
+    "arbeitet": ("live",     "LAEUFT GERADE",    3),
+    "wartet":   ("warte",    "WARTET AUF DICH",  2),
+    "fehler":   ("tot",      "TURN ABGEBROCHEN", 1),
+    "beendet":  ("kalt",     "BEENDET",          4),
+}
+
+
+def lifecycle_laden():
+    """Zustandssaetze der Hooks einlesen. Fehlt der Ordner, ist das kein Fehler."""
+    satz = {}
+    if not os.path.isdir(LEBEN):
+        return satz
+    try:
+        for name in os.listdir(LEBEN):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(LEBEN, name), encoding="utf-8") as fh:
+                    e = json.load(fh)
+                if isinstance(e, dict) and e.get("session_id"):
+                    satz[e["session_id"]] = e
+            except Exception as ex:
+                warn("Lifecycle-Datei %s unlesbar: %s" % (name, ex))
+    except OSError as ex:
+        warn("Lifecycle-Ordner nicht lesbar: %s" % ex)
+    return satz
+
+
+def _alter(iso):
+    try:
+        d = datetime.datetime.fromisoformat(iso)
+        if d.tzinfo is None:
+            d = d.astimezone()
+        return (datetime.datetime.now().astimezone() - d).total_seconds()
+    except Exception:
+        return None
+
+
+def lifecycle_frisch(e):
+    """Ist der gemeldete Zustand noch glaubwuerdig?"""
+    if not e:
+        return False
+    zustand = e.get("state")
+    if zustand not in HALTBAR:
+        return False
+    grenze = HALTBAR[zustand]
+    if grenze is None:
+        return True
+    alt = _alter(e.get("last_event_at") or "")
+    return alt is not None and 0 <= alt <= grenze
+
+
+def status(inf, leben=None):
+    # 1. Vorrang hat der Hook, solange sein Zustand frisch genug ist.
+    e = (leben or {}).get(inf.get("id"))
+    if lifecycle_frisch(e) and e.get("state") in LEBEN_ZU_SPALTE:
+        spalte, text, rang = LEBEN_ZU_SPALTE[e["state"]]
+        return spalte, text, rang, "hook"
+
+    # 2. Sonst wie bisher aus Transkript und Aenderungszeit herleiten.
     alt = datetime.datetime.now().timestamp() - inf["mtime"]
     if alt < 120:
-        return "live", "LAEUFT GERADE", 2
+        return "live", "LAEUFT GERADE", 3, "hergeleitet"
     if alt > 604800:
-        return "kalt", "KALT", 3
+        return "kalt", "KALT", 4, "hergeleitet"
     if inf["last_role"] == "user":
-        return "tot", "ABGEBROCHEN", 0
+        return "tot", "ABGEBROCHEN", 1, "hergeleitet"
     if inf["last_role"] == "assistant":
-        return "warte", "WARTET AUF ANTWORT", 1
-    return "kalt", "OHNE VERLAUF", 3
+        return "warte", "WARTET AUF ANTWORT", 2, "hergeleitet"
+    return "kalt", "OHNE VERLAUF", 4, "hergeleitet"
 
 
 DEMO_TITEL = [
@@ -660,8 +747,9 @@ def eskalation_schleife(intervall=300, schwelle=3600):
                 bekannt = dict(zustand_laden()["eskaliert"])
             jetzt = datetime.datetime.now().timestamp()
             faellig = {}
+            leben = lifecycle_laden()
             for s in collect():
-                if status(s)[0] != "warte":
+                if status(s, leben)[0] != "warte":
                     continue
                 wartet = jetzt - s["mtime"]
                 if wartet < schwelle or wartet > 86400:
@@ -688,6 +776,7 @@ CSS = """
   --warte:#FF8C42; --warte-w:rgba(255,140,66,.13);
   --live:#3DDC84; --live-w:rgba(61,220,132,.12);
   --kalt:#4FC3F7; --kalt-w:rgba(79,195,247,.11);
+  --freigabe:#C084FC; --freigabe-w:rgba(192,132,252,.14);
   --blau:#5B8DEF; --tuerkis:#22D3EE;
   --lila:#A855F7;
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
@@ -818,8 +907,9 @@ body{margin:0;color:var(--fg);font-family:var(--sans);
 .leiste .rechts{margin-left:auto;display:flex;gap:10px}
 
 /* ---------------- Board ---------------- */
-.board{display:grid;gap:12px;grid-template-columns:repeat(4,minmax(0,1fr));align-items:start}
-@media(max-width:1200px){.board{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.board{display:grid;gap:12px;grid-template-columns:repeat(5,minmax(0,1fr));align-items:start}
+@media(max-width:1500px){.board{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:1100px){.board{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:700px){.board{grid-template-columns:minmax(0,1fr)}}
 .spalte{background:rgba(11,17,31,.66);border:1px solid var(--line);border-radius:14px;
   display:flex;flex-direction:column;overflow:hidden}
@@ -830,6 +920,11 @@ body{margin:0;color:var(--fg);font-family:var(--sans);
 .spalte.warte .sp-kopf .ic{background:var(--warte-w);color:var(--warte)}
 .spalte.live  .sp-kopf .ic{background:var(--live-w);color:var(--live)}
 .spalte.kalt  .sp-kopf .ic{background:var(--kalt-w);color:var(--kalt)}
+.spalte.freigabe .sp-kopf .ic{background:var(--freigabe-w);color:var(--freigabe)}
+.spalte.freigabe .sp-kopf h2{color:var(--freigabe)}
+.karte.freigabe{border-left-color:var(--freigabe);
+  background:linear-gradient(180deg,rgba(192,132,252,.07),var(--karte))}
+.spalte.freigabe .marke-tag{background:var(--freigabe-w);color:var(--freigabe)}
 .sp-kopf h2{margin:0;font-size:13px;font-weight:600;flex:1;white-space:nowrap;
   overflow:hidden;text-overflow:ellipsis}
 .spalte.tot .sp-kopf h2{color:var(--tot)} .spalte.warte .sp-kopf h2{color:var(--warte)}
@@ -859,7 +954,14 @@ body{margin:0;color:var(--fg);font-family:var(--sans);
 .karte.markiert{border-color:var(--warte);box-shadow:0 0 0 1px var(--warte)}
 .karte.oeffnet{border-color:var(--live);box-shadow:0 0 0 1px var(--live)}
 .karte.fehler{border-color:var(--tot);box-shadow:0 0 0 1px var(--tot)}
-.k-id{font-family:var(--mono);font-size:10px;color:var(--dim)}
+.k-id{font-family:var(--mono);font-size:10px;color:var(--dim);display:flex;
+  align-items:center;gap:7px;flex-wrap:wrap}
+.werkzeugmarke{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;
+  padding:2px 7px;border-radius:5px;background:var(--live-w);color:var(--live)}
+.spalte.freigabe .werkzeugmarke{background:var(--freigabe-w);color:var(--freigabe)}
+.quelle{margin-left:auto;font-size:9px;letter-spacing:.1em;color:var(--dim);
+  border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+.quelle.hook{color:var(--live);border-color:rgba(61,220,132,.35)}
 .k-titel{font-size:13px;line-height:1.35;font-weight:600;margin:0;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .k-txt{font-size:11.5px;line-height:1.5;color:var(--fg-2);margin:0;
@@ -1083,8 +1185,11 @@ window.addEventListener('keydown', function(e){
 });
 """
 
-SPALTEN = [("tot", "Abgebrochen", "&#9888;"), ("warte", "Wartet auf dich", "&#9203;"),
-           ("live", "Läuft gerade", "&#9654;"), ("kalt", "Kalt", "&#10052;")]
+SPALTEN = [("freigabe", "Braucht Freigabe", "&#9995;"),
+           ("tot", "Abgebrochen", "&#9888;"),
+           ("warte", "Wartet auf dich", "&#9203;"),
+           ("live", "Läuft gerade", "&#9654;"),
+           ("kalt", "Kalt", "&#10052;")]
 
 
 def _geld(x):
@@ -1163,8 +1268,10 @@ def build(sessions, platz=0, archiv=False):
     stunde = jetzt.hour
     tagesgruss = "Guten Morgen" if stunde < 11 else ("Guten Tag" if stunde < 18 else "Guten Abend")
 
+    leben = lifecycle_laden()
     for s in sessions:
-        s["zustand"] = status(s)
+        s["leben"] = leben.get(s["id"]) or {}
+        s["zustand"] = status(s, leben)
     sessions.sort(key=lambda s: -s["mtime"])
 
     reihe = tagesreihe(sessions, 14)
@@ -1177,6 +1284,8 @@ def build(sessions, platz=0, archiv=False):
     vorwoche = sum(tok_reihe[:7])
     delta = ((woche - vorwoche) / vorwoche * 100.0) if vorwoche else None
 
+    n_freigabe = sum(1 for s in sessions if s["zustand"][0] == "freigabe")
+    n_hook = sum(1 for s in sessions if len(s["zustand"]) > 3 and s["zustand"][3] == "hook")
     n_warte = sum(1 for s in sessions if s["zustand"][0] == "warte")
     n_live = sum(1 for s in sessions if s["zustand"][0] == "live")
     n_tot = sum(1 for s in sessions if s["zustand"][0] == "tot")
@@ -1232,8 +1341,12 @@ def build(sessions, platz=0, archiv=False):
              "<input id='q' type='text' placeholder='Sessions durchsuchen…' autocomplete='off'>"
              "<span class='kbd'>&#8984;K</span></div>")
     p.append("<div class='zustandspille'><i></i><div>"
-             "<div class='a'>%d warten</div><div class='b'>%d aktiv, %d abgebrochen</div>"
-             "</div></div>" % (n_warte, n_live, n_tot))
+             "<div class='a'>%s</div>"
+             "<div class='b'>%d aktiv &middot; %d abgebrochen &middot; %d per Hook</div>"
+             "</div></div>"
+             % (("%d brauchen Freigabe" % n_freigabe) if n_freigabe
+                else ("%d warten" % n_warte),
+                n_live, n_tot, n_hook))
     if not NUR_LESEN:
         p.append("<button class='haupt-knopf' data-neu='1'>+ Neue Session</button>")
     p.append("<button class='rundknopf' id='neuladen' title='Neu laden'>&#8635;</button>")
@@ -1349,7 +1462,18 @@ def build(sessions, platz=0, archiv=False):
 
             p.append("<article class='karte' data-sid='%s' data-cmd=\"%s\" data-such=\"%s\">"
                      % (e(s["id"]), e(cmd), e(such[:600])))
-            p.append("<div class='k-id'>#%s</div>" % s["id"][:6])
+            leben_s = s.get("leben") or {}
+            quelle = s["zustand"][3] if len(s["zustand"]) > 3 else "hergeleitet"
+            marke = ""
+            if quelle == "hook" and leben_s.get("current_tool"):
+                marke = "<span class='werkzeugmarke'>%s</span>" % e(str(leben_s["current_tool"])[:20])
+            p.append("<div class='k-id'>#%s%s<span class='quelle %s' title='%s'>%s</span></div>"
+                     % (s["id"][:6], marke,
+                        "hook" if quelle == "hook" else "",
+                        "Zustand kommt direkt aus einem Claude-Code-Hook"
+                        if quelle == "hook" else
+                        "Zustand aus Transkript und Aenderungszeit hergeleitet",
+                        "HOOK" if quelle == "hook" else "hergeleitet"))
             p.append("<h3 class='k-titel'>%s</h3>" % e(titel[:110]))
             if txt:
                 p.append("<p class='k-txt'>%s</p>" % txt)

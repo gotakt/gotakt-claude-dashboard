@@ -174,3 +174,214 @@ class Zeit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------- Lifecycle
+import subprocess as _sp
+
+HOOK = os.path.join(WURZEL, "hooks", "lifecycle.py")
+
+
+def hook(ereignis, ordner, **rest):
+    """Ein Hook-Ereignis abfeuern, mit umgebogenem Zielordner."""
+    nutzlast = dict(rest)
+    nutzlast["hook_event_name"] = ereignis
+    umgebung = dict(os.environ, HOME=ordner)
+    return _sp.run([sys.executable, HOOK], input=json.dumps(nutzlast),
+                   text=True, capture_output=True, env=umgebung)
+
+
+def satz(ordner, sid):
+    p = os.path.join(ordner, ".claude", "dashboard", "lifecycle", sid + ".json")
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+class LifecycleHook(unittest.TestCase):
+    def setUp(self):
+        self.heim = tempfile.mkdtemp()
+        self.sid = "sitzung-1"
+
+    def _feuer(self, ereignis, **rest):
+        r = hook(ereignis, self.heim, session_id=self.sid, cwd="/tmp/p", **rest)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return satz(self.heim, self.sid)
+
+    def test_sessionstart_legt_an(self):
+        e = self._feuer("SessionStart", source="startup")
+        self.assertEqual(e["state"], "bereit")
+        self.assertEqual(e["source"], "startup")
+
+    def test_prompt_bedeutet_arbeit(self):
+        e = self._feuer("UserPromptSubmit", prompt="mach mal was")
+        self.assertEqual(e["state"], "arbeitet")
+
+    def test_pretooluse_merkt_werkzeug(self):
+        e = self._feuer("PreToolUse", tool_name="Bash",
+                        tool_input={"command": "rm -rf /"})
+        self.assertEqual(e["state"], "arbeitet")
+        self.assertEqual(e["current_tool"], "Bash")
+        self.assertIsNotNone(e["tool_started_at"])
+
+    def test_posttooluse_raeumt_werkzeug_weg(self):
+        self._feuer("PreToolUse", tool_name="Edit")
+        e = self._feuer("PostToolUse", tool_name="Edit", tool_response={"x": 1})
+        self.assertIsNone(e["current_tool"])
+        self.assertTrue(e["last_tool_ok"])
+
+    def test_werkzeugfehler_wird_vermerkt(self):
+        self._feuer("PreToolUse", tool_name="Bash")
+        e = self._feuer("PostToolUseFailure", tool_name="Bash")
+        self.assertFalse(e["last_tool_ok"])
+        self.assertIsNone(e["current_tool"])
+
+    def test_permissionrequest_eigener_zustand(self):
+        e = self._feuer("PermissionRequest", tool_name="Bash")
+        self.assertEqual(e["state"], "freigabe")
+
+    def test_stop_bedeutet_wartet(self):
+        e = self._feuer("Stop")
+        self.assertEqual(e["state"], "wartet")
+
+    def test_stopfailure(self):
+        e = self._feuer("StopFailure")
+        self.assertEqual(e["state"], "fehler")
+
+    def test_sessionend_mit_grund(self):
+        e = self._feuer("SessionEnd", reason="clear")
+        self.assertEqual(e["state"], "beendet")
+        self.assertEqual(e["end_reason"], "clear")
+        self.assertIsNotNone(e["ended_at"])
+
+    def test_keine_inhalte_im_zustand(self):
+        e = self._feuer("PreToolUse", tool_name="Bash",
+                        tool_input={"command": "echo geheim"},
+                        prompt="auch geheim")
+        roh = json.dumps(e)
+        self.assertNotIn("geheim", roh)
+        for k in ("tool_input", "prompt", "tool_response", "command", "message"):
+            self.assertNotIn(k, e)
+
+    def test_unbekanntes_ereignis_aendert_nichts(self):
+        self._feuer("Stop")
+        e = self._feuer("Quatsch")
+        self.assertEqual(e["state"], "wartet")
+
+    def test_ohne_sitzungskennung_kein_schreiben(self):
+        r = hook("Stop", self.heim, cwd="/tmp/p")
+        self.assertEqual(r.returncode, 0)
+        self.assertIsNone(satz(self.heim, ""))
+
+    def test_kaputte_eingabe_bricht_nicht(self):
+        umgebung = dict(os.environ, HOME=self.heim)
+        r = _sp.run([sys.executable, HOOK], input="kein json",
+                    text=True, capture_output=True, env=umgebung)
+        self.assertEqual(r.returncode, 0)
+
+    def test_parallele_schreibvorgaenge(self):
+        import threading
+        def feuern(i):
+            hook("PreToolUse", self.heim, session_id=self.sid,
+                 cwd="/tmp/p", tool_name="W%d" % i)
+        faeden = [threading.Thread(target=feuern, args=(i,)) for i in range(12)]
+        for f in faeden:
+            f.start()
+        for f in faeden:
+            f.join()
+        e = satz(self.heim, self.sid)
+        self.assertIsNotNone(e, "Zustandsdatei fehlt nach paralleler Last")
+        self.assertEqual(e["state"], "arbeitet")
+
+
+class LifecycleVorrang(unittest.TestCase):
+    def _inf(self, rolle, alter, sid="s1"):
+        return {"id": sid, "last_role": rolle,
+                "mtime": datetime.datetime.now().timestamp() - alter}
+
+    def _leben(self, zustand, alter, sid="s1"):
+        wann = datetime.datetime.now().astimezone() - datetime.timedelta(seconds=alter)
+        return {sid: {"session_id": sid, "state": zustand,
+                      "last_event_at": wann.isoformat(timespec="seconds")}}
+
+    def test_frischer_hook_schlaegt_herleitung(self):
+        # Transkript sagt "wartet", Hook sagt "arbeitet"
+        z = d.status(self._inf("assistant", 600), self._leben("arbeitet", 30))
+        self.assertEqual(z[0], "live")
+        self.assertEqual(z[3], "hook")
+
+    def test_freigabe_wird_eigene_spalte(self):
+        z = d.status(self._inf("assistant", 600), self._leben("freigabe", 60))
+        self.assertEqual(z[0], "freigabe")
+        self.assertEqual(z[3], "hook")
+
+    def test_veralteter_arbeitet_faellt_zurueck(self):
+        z = d.status(self._inf("assistant", 600), self._leben("arbeitet", 3 * 3600))
+        self.assertEqual(z[0], "warte")
+        self.assertEqual(z[3], "hergeleitet")
+
+    def test_ohne_hook_wie_bisher(self):
+        z = d.status(self._inf("user", 600), {})
+        self.assertEqual(z[0], "tot")
+        self.assertEqual(z[3], "hergeleitet")
+
+    def test_beendet_veraltet_nie(self):
+        z = d.status(self._inf("assistant", 600), self._leben("beendet", 30 * 86400))
+        self.assertEqual(z[0], "kalt")
+        self.assertEqual(z[3], "hook")
+
+    def test_kaputter_zeitstempel_faellt_zurueck(self):
+        z = d.status(self._inf("assistant", 600),
+                     {"s1": {"session_id": "s1", "state": "arbeitet",
+                             "last_event_at": "voellig kaputt"}})
+        self.assertEqual(z[3], "hergeleitet")
+
+
+class HookInstallation(unittest.TestCase):
+    """Die Installation darf fremde Einstellungen nicht anfassen."""
+
+    def setUp(self):
+        self.heim = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.heim, ".claude"))
+        self.datei = os.path.join(self.heim, ".claude", "settings.json")
+
+    def _lauf(self):
+        return _sp.run([sys.executable, os.path.join(WURZEL, "hooks", "install-hooks.py")],
+                       text=True, capture_output=True,
+                       env=dict(os.environ, HOME=self.heim))
+
+    def _cfg(self):
+        with open(self.datei, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def _zaehle(self, cfg, teil):
+        n = 0
+        for liste in (cfg.get("hooks") or {}).values():
+            for g in liste:
+                for h in g.get("hooks", []):
+                    if teil in h.get("command", ""):
+                        n += 1
+        return n
+
+    def test_idempotent_und_fremdes_bleibt(self):
+        json.dump({"model": "opus", "theme": "dark",
+                   "hooks": {"Stop": [{"hooks": [{"type": "command",
+                                                  "command": "python3 stop-notify.py"}]}]}},
+                  open(self.datei, "w", encoding="utf-8"))
+        self.assertEqual(self._lauf().returncode, 0)
+        eins = self._cfg()
+        self.assertEqual(self._lauf().returncode, 0)
+        zwei = self._cfg()
+
+        self.assertEqual(self._zaehle(eins, "lifecycle.py"), 9)
+        self.assertEqual(self._zaehle(zwei, "lifecycle.py"), 9, "zweiter Lauf hat doppelt eingetragen")
+        self.assertEqual(self._zaehle(zwei, "stop-notify"), 1, "fremder Hook verloren")
+        self.assertEqual(zwei["model"], "opus")
+        self.assertEqual(zwei["theme"], "dark")
+
+    def test_kaputte_datei_wird_nicht_angefasst(self):
+        open(self.datei, "w").write("{kein json")
+        r = self._lauf()
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(open(self.datei).read(), "{kein json")
