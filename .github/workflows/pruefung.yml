@@ -1,0 +1,24 @@
+name: Pruefung
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Syntax
+        run: |
+          python -m py_compile dash.py hooks/stop-notify.py
+      - name: Tests
+        run: python -m unittest discover -s tests -v
+      - name: Keine externen Anfragen im erzeugten HTML
+        run: |
+          ! grep -rE "googleapis|gstatic|https?://(?!localhost|127\.0\.0\.1)" dash.py \
+            --include=dash.py -P || (echo "externer Verweis gefunden" && exit 1)

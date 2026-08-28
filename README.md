@@ -14,7 +14,9 @@ had stopped.
 
 ## What it does
 
-Every session lands in one of four states, derived from the transcript:
+Every session lands in one of four states. These are **inferred** from the transcript
+file: who spoke last, and when the file last changed. A session running a long command
+without writing to the transcript can therefore look aborted.
 
 | State | Meaning |
 |---|---|
@@ -29,8 +31,10 @@ exchange, how long it has been waiting, and the token cost.
 - **Click a card** and the matching Terminal window and tab is brought to the
   front. If no window is open, a new one starts with `claude -r <id>`.
 - **Answer without a terminal** on crashed or cold sessions, via `claude -r -p`.
-  Refused when the session is open in a terminal, so two writers can never fight
-  over the same transcript.
+  Before starting a second writer the dashboard looks for a Terminal tab whose title
+  matches the session, and refuses if it finds one. The match is by tab title, so it
+  is a good check, not a guarantee: if two tabs carry the same title the dashboard
+  refuses as well rather than guessing.
 - **Cost and tokens** are summed from the `usage` fields of every message,
   per model, with a configurable price table.
 - **Budget** for today and this week, with a ring that turns orange and then red.
@@ -39,8 +43,15 @@ exchange, how long it has been waiting, and the token cost.
 - **Keyboard**: `j` `k` to move, `Enter` to open, `e` to archive, `/` or `⌘K` to
   search, `⌘J` for the numbers panel.
 
-Nothing leaves the machine. The server binds to `127.0.0.1` and only reads files
-under `~/.claude`.
+**On data.** The dashboard itself makes no network requests: no fonts, no CDN, no
+telemetry. It binds to `127.0.0.1`, reads only files under `~/.claude`, and writes
+its own state to `~/.claude/dashboard/`. Actions that invoke Claude Code (opening a
+session, sending a reply) run Claude Code normally, and Claude Code talks to
+Anthropic as it always does.
+
+**On access.** The action endpoints are POST only and require a per-run token that is
+embedded in the page. `Host` and `Origin` are validated. A static snapshot carries no
+token and renders read-only.
 
 ## Requirements
 
@@ -51,8 +62,8 @@ under `~/.claude`.
 ## Run it
 
 ```bash
-git clone https://github.com/<you>/claude-session-dashboard.git
-cd claude-session-dashboard
+git clone https://github.com/maroxd3/gotakt-claude-dashboard.git
+cd gotakt-claude-dashboard
 python3 dash.py --serve
 ```
 
@@ -62,23 +73,30 @@ The first request takes a few seconds because every transcript is scanned once
 for token counts. After that only new bytes are read, so it stays well under a
 second even with several hundred megabytes of history.
 
-Build a static file instead of running a server:
+Build a **read-only snapshot** instead of running a server:
 
 ```bash
-python3 dash.py          # writes index.html and opens it
+python3 dash.py          # writes ~/.claude/dashboard/index.html and opens it
 python3 dash.py --demo   # same, with all titles and texts replaced
 ```
 
-Demo mode is there for screenshots and screen recordings. It keeps the real
-numbers and replaces every name and message with a placeholder.
+The snapshot has no token and no action buttons, because opening a terminal or
+sending a reply needs the server. It is written to `~/.claude/dashboard/`, not next
+to the repository, so a synced folder never picks up transcript excerpts.
+
+Demo mode is for screenshots and screen recordings. It replaces every name, title
+and message with a placeholder **but keeps the real numbers**: session count, tokens,
+cost and durations are yours. If that matters for what you are publishing, crop them.
 
 ## Start it automatically
 
 ```bash
-cp launchagent/de.gotakt.claude-dashboard.plist ~/Library/LaunchAgents/
-# replace __HOME__ and __PYTHON__ inside the copied file first
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/de.gotakt.claude-dashboard.plist
+./install.sh          # optional: ./install.sh 9000 for another port
 ```
+
+The script finds `python3`, `claude` and the repository path itself, writes the
+plist, creates `logs/` and starts the service. `KeepAlive` is on, so it comes back
+if it dies.
 
 `KeepAlive` is on, so the service comes back on its own if it dies. To remove it:
 

@@ -8,14 +8,24 @@ Claude Code Session Dashboard
 
 Liest ausschliesslich lokale Dateien unter ~/.claude. Nichts verlaesst den Rechner.
 """
-import os, sys, json, html, subprocess, datetime, re, shlex, threading, time
+import os, sys, json, html, subprocess, datetime, re, shlex, threading, time, secrets, shutil
 
 ROOT   = os.path.expanduser("~/.claude/projects")
+DATEN  = os.path.expanduser("~/.claude/dashboard")
 PAPIER = os.path.expanduser("~/.claude/projects/_papierkorb")
-OUT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-CACHE  = os.path.expanduser("~/.claude/dashboard-cache.json")
+OUT    = os.path.join(DATEN, "index.html")
+CACHE  = os.path.join(DATEN, "cache.json")
 CACHE_V = 3
-STATE  = os.path.expanduser("~/.claude/dashboard-state.json")
+STATE  = os.path.join(DATEN, "state.json")
+CLAUDE = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
+TOKEN  = secrets.token_urlsafe(32)
+SPERRE = threading.RLock()
+NUR_LESEN = False
+
+
+def warn(text):
+    """Fehler sichtbar machen statt verschlucken."""
+    print("WARN %s" % text, file=sys.stderr, flush=True)
 HOOK   = os.path.expanduser("~/.claude/hooks/stop-notify.py")
 
 # Anrede: ueber die Umgebungsvariable CLAUDE_DASH_NAME setzbar
@@ -58,12 +68,13 @@ def _lade(pfad, standard):
 
 def _sichere(pfad, daten):
     try:
+        os.makedirs(os.path.dirname(pfad), exist_ok=True)
         tmp = pfad + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(daten, fh)
         os.replace(tmp, pfad)
-    except Exception:
-        pass
+    except Exception as ex:
+        warn("Zustand konnte nicht geschrieben werden (%s): %s" % (pfad, ex))
 
 
 def zustand_laden():
@@ -76,6 +87,7 @@ def zustand_laden():
 
 
 def budget_setzen(tag, woche):
+  with SPERRE:
     z = zustand_laden()
     try:
         z["budget_tag"] = max(0.0, float(tag))
@@ -454,41 +466,70 @@ def terminal_tabs():
 
 
 def finde_tab(s):
+    """Ordnet ueber den Tab-Titel zu. Bei Mehrdeutigkeit lieber nichts als falsch."""
     titel = _norm(s.get("title") or "")
     if not titel:
         return None
-    for wid, tabnr, wtitel in terminal_tabs():
-        if _norm(wtitel) == titel:
-            return (wid, tabnr)
-    return None
+    treffer = [(w, t) for w, t, wt in terminal_tabs() if _norm(wt) == titel]
+    if len(treffer) != 1:
+        if len(treffer) > 1:
+            warn("Titel %r passt auf %d Tabs, Zuordnung uneindeutig" % (titel, len(treffer)))
+        return None
+    return treffer[0]
+
+
+def tab_mehrdeutig(s):
+    titel = _norm(s.get("title") or "")
+    if not titel:
+        return False
+    return sum(1 for _, _, wt in terminal_tabs() if _norm(wt) == titel) > 1
+
+
+def fortsetzen_befehl(s):
+    """Ein einziger Ort fuer den Befehl, damit Anzeige und Ausfuehrung gleich sind."""
+    cwd = s.get("cwd") or os.path.expanduser("~")
+    return "cd %s && %s -r %s" % (shlex.quote(cwd), shlex.quote(CLAUDE), shlex.quote(s["id"]))
 
 
 def oeffne_sitzung(s):
     treffer = finde_tab(s)
     if treffer:
         wid, tabnr = treffer
-        _osa('tell application "Terminal"\n'
-             '  set w to window id %d\n'
-             '  try\n'
-             '    set selected tab of w to tab %d of w\n'
-             '  end try\n'
-             '  set index of w to 1\n'
-             '  activate\n'
-             'end tell' % (wid, tabnr))
+        out, rc = _osa('tell application "Terminal"\n'
+                       '  set w to window id %d\n'
+                       '  try\n'
+                       '    set selected tab of w to tab %d of w\n'
+                       '  end try\n'
+                       '  set index of w to 1\n'
+                       '  activate\n'
+                       'end tell' % (wid, tabnr))
+        if rc != 0:
+            warn("Terminal-Fenster %s liess sich nicht holen: %s" % (wid, out))
+            return {"ok": False, "fehler": out[:200] or "AppleScript fehlgeschlagen"}
         return {"ok": True, "modus": "vorhanden", "fenster": wid, "tab": tabnr}
 
-    cwd = s.get("cwd") or os.path.expanduser("~")
-    befehl = "cd %s && claude -r %s" % (shlex.quote(cwd), shlex.quote(s["id"]))
-    sicher = befehl.replace("\\", "\\\\").replace('"', '\\"')
-    _osa('tell application "Terminal"\n  do script "%s"\n  activate\nend tell' % sicher)
+    if tab_mehrdeutig(s):
+        return {"ok": False, "fehler": "Mehrere Terminal-Tabs tragen denselben Titel. "
+                                       "Bitte den richtigen Tab von Hand waehlen."}
+
+    sicher = fortsetzen_befehl(s).replace("\\", "\\\\").replace('"', '\\"')
+    out, rc = _osa('tell application "Terminal"\n  do script "%s"\n  activate\nend tell' % sicher)
+    if rc != 0:
+        warn("neues Terminal liess sich nicht oeffnen: %s" % out)
+        return {"ok": False, "fehler": out[:200] or "AppleScript fehlgeschlagen"}
     return {"ok": True, "modus": "neu"}
 
 
 def antworte(s, text):
     """Antwort ohne Terminal einspielen. Nur wenn kein Fenster offen ist."""
     if finde_tab(s):
-        return {"ok": False, "fehler": "Diese Sitzung ist in einem Terminal offen. "
+        return {"ok": False, "fehler": "Zu dieser Sitzung ist ein Terminal-Tab offen. "
                                        "Antworte dort, sonst schreiben zwei Stellen gleichzeitig."}
+    if tab_mehrdeutig(s):
+        return {"ok": False, "fehler": "Mehrere Terminal-Tabs tragen denselben Titel. "
+                                       "Die Zuordnung ist nicht eindeutig, deshalb keine Antwort von hier."}
+    if not shutil.which(CLAUDE) and not os.path.exists(CLAUDE):
+        return {"ok": False, "fehler": "claude nicht gefunden. Setze CLAUDE_BIN auf den vollen Pfad."}
     text = (text or "").strip()
     if not text:
         return {"ok": False, "fehler": "leerer Text"}
@@ -498,7 +539,7 @@ def antworte(s, text):
     if not os.path.isdir(cwd):
         cwd = os.path.expanduser("~")
     try:
-        subprocess.Popen(["claude", "-r", s["id"], "-p", text],
+        subprocess.Popen([CLAUDE, "-r", s["id"], "-p", text],
                          cwd=cwd,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL, start_new_session=True)
@@ -510,28 +551,80 @@ def antworte(s, text):
 
 
 def erledigt_setzen(sid, an=True):
-    z = zustand_laden()
-    menge = set(z["erledigt"])
-    menge.add(sid) if an else menge.discard(sid)
-    z["erledigt"] = sorted(menge)
-    _sichere(STATE, z)
+    with SPERRE:
+        z = zustand_laden()
+        menge = set(z["erledigt"])
+        menge.add(sid) if an else menge.discard(sid)
+        z["erledigt"] = sorted(menge)
+        _sichere(STATE, z)
     return {"ok": True, "erledigt": an}
 
 
+PAPIER_INDEX = os.path.join(PAPIER, "_index.json")
+
+
 def in_papierkorb(s):
-    """Protokoll verschieben statt loeschen. Jederzeit zurueckholbar."""
-    try:
-        os.makedirs(PAPIER, exist_ok=True)
-        ziel = os.path.join(PAPIER, os.path.basename(s["file"]))
-        if os.path.exists(ziel):
-            ziel = ziel[:-6] + "-" + str(int(s["mtime"])) + ".jsonl"
-        os.rename(s["file"], ziel)
-        cache = _lade(CACHE, {})
-        cache.pop(s["file"], None)
-        _sichere(CACHE, cache)
-        return {"ok": True, "ziel": ziel}
-    except Exception as ex:
-        return {"ok": False, "fehler": str(ex)[:160]}
+    """Verschieben statt loeschen, mit Merkzettel fuer die Rueckholung."""
+    with SPERRE:
+        try:
+            os.makedirs(PAPIER, exist_ok=True)
+            ziel = os.path.join(PAPIER, os.path.basename(s["file"]))
+            if os.path.exists(ziel):
+                ziel = ziel[:-6] + "-" + str(int(s["mtime"])) + ".jsonl"
+            os.rename(s["file"], ziel)
+
+            index = _lade(PAPIER_INDEX, {})
+            index[os.path.basename(ziel)] = {
+                "sitzung": s["id"],
+                "titel": s.get("title") or "",
+                "herkunft": s["file"],
+                "verworfen_am": datetime.datetime.now().isoformat(timespec="seconds"),
+            }
+            _sichere(PAPIER_INDEX, index)
+
+            cache = _lade(CACHE, {})
+            cache.pop(s["file"], None)
+            _sichere(CACHE, cache)
+            return {"ok": True, "ziel": ziel}
+        except Exception as ex:
+            warn("Papierkorb fehlgeschlagen: %s" % ex)
+            return {"ok": False, "fehler": str(ex)[:160]}
+
+
+def papierkorb_inhalt():
+    index = _lade(PAPIER_INDEX, {})
+    eintraege = []
+    for name, meta in sorted(index.items()):
+        pfad = os.path.join(PAPIER, name)
+        if os.path.exists(pfad):
+            eintraege.append(dict(meta, datei=name))
+    return eintraege
+
+
+def aus_papierkorb(name):
+    """Protokoll an seinen urspruenglichen Ort zurueckschieben."""
+    with SPERRE:
+        try:
+            index = _lade(PAPIER_INDEX, {})
+            meta = index.get(name)
+            if not meta:
+                return {"ok": False, "fehler": "kein Eintrag im Papierkorb"}
+            quelle = os.path.join(PAPIER, name)
+            ziel = meta.get("herkunft") or ""
+            if not quelle.startswith(PAPIER) or not os.path.exists(quelle):
+                return {"ok": False, "fehler": "Datei fehlt"}
+            if not ziel.startswith(ROOT):
+                return {"ok": False, "fehler": "Herkunft liegt ausserhalb von ~/.claude/projects"}
+            if os.path.exists(ziel):
+                return {"ok": False, "fehler": "am Zielort liegt bereits eine Datei"}
+            os.makedirs(os.path.dirname(ziel), exist_ok=True)
+            os.rename(quelle, ziel)
+            index.pop(name, None)
+            _sichere(PAPIER_INDEX, index)
+            return {"ok": True, "ziel": ziel}
+        except Exception as ex:
+            warn("Rueckholen fehlgeschlagen: %s" % ex)
+            return {"ok": False, "fehler": str(ex)[:160]}
 
 
 def melde(titel, untertitel, text):
@@ -565,36 +658,44 @@ def eskalation_schleife(intervall=300, schwelle=3600):
                 geaendert = True
             if geaendert:
                 _sichere(STATE, z)
-        except Exception:
-            pass
+        except Exception as ex:
+            warn("Eskalationsschleife: %s" % ex)
 
 
 # ---------------------------------------------------------------- html
 CSS = """
 :root{
   color-scheme:dark;
-  --bg:#05060A; --flaeche:#0A0C12; --karte:#0E1119; --karte-2:#141824;
-  --line:#1A1E2B; --line-2:#252B3B;
-  --fg:#E7EAF2; --fg-2:#98A0B5; --dim:#6A7189;
+  --bg:#070B14; --flaeche:#0B111F; --karte:#101828; --karte-2:#151E31;
+  --line:#1B2438; --line-2:#28344E;
+  --fg:#E8ECF6; --fg-2:#9AA5BF; --dim:#6B7591;
   --tot:#FF4D4D; --tot-w:rgba(255,77,77,.13);
   --warte:#FF8C42; --warte-w:rgba(255,140,66,.13);
   --live:#3DDC84; --live-w:rgba(61,220,132,.12);
   --kalt:#4FC3F7; --kalt-w:rgba(79,195,247,.11);
+  --blau:#5B8DEF; --tuerkis:#22D3EE;
   --lila:#A855F7;
-  --mono:"JetBrains Mono","IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
-  --sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
 }
 *,*::before,*::after{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
+body{margin:0;color:var(--fg);font-family:var(--sans);
   font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums;
-  display:flex;overflow:hidden}
+  display:flex;overflow:hidden;
+  background:
+    radial-gradient(1100px 620px at 12% -12%, rgba(91,141,239,.13), transparent 62%),
+    radial-gradient(900px 520px at 88% -6%,  rgba(168,85,247,.11), transparent 60%),
+    radial-gradient(1000px 700px at 55% 112%, rgba(34,211,238,.07), transparent 62%),
+    var(--bg);
+  background-attachment:fixed}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:6px}
 
 /* ---------------- Seitenleiste ---------------- */
-.seite{width:212px;flex:none;background:var(--flaeche);border-right:1px solid var(--line);
+.seite{width:212px;flex:none;background:rgba(11,17,31,.72);backdrop-filter:blur(14px);
+  border-right:1px solid var(--line);
   display:flex;flex-direction:column;padding:16px 12px}
 .logo{display:flex;align-items:center;gap:10px;padding:4px 8px 22px}
 .logo .stern{width:26px;height:26px;border-radius:8px;flex:none;
@@ -623,7 +724,7 @@ body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
 /* ---------------- Hauptbereich ---------------- */
 .haupt{flex:1;min-width:0;display:flex;flex-direction:column}
 .kopf{height:60px;flex:none;display:flex;align-items:center;gap:14px;padding:0 18px;
-  border-bottom:1px solid var(--line);background:var(--flaeche)}
+  border-bottom:1px solid var(--line);background:rgba(11,17,31,.6);backdrop-filter:blur(14px)}
 .suche{flex:0 1 420px;display:flex;align-items:center;gap:9px;background:var(--karte);
   border:1px solid var(--line);border-radius:10px;padding:8px 12px}
 .suche input{flex:1;background:transparent;border:0;outline:0;color:var(--fg);
@@ -658,7 +759,8 @@ body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
 @media(min-width:1180px){.oben{grid-template-columns:300px repeat(4,minmax(0,1fr))}}
 .gruss h1{margin:0 0 6px;font-size:23px;font-weight:600;letter-spacing:-.02em}
 .gruss p{margin:0;color:var(--dim);font-size:12.5px}
-.kachel{background:var(--karte);border:1px solid var(--line);border-radius:13px;
+.kachel{background:linear-gradient(160deg,rgba(21,30,49,.92),rgba(16,24,40,.86));
+  border:1px solid var(--line);border-radius:13px;
   padding:14px 15px;position:relative;overflow:hidden;min-height:96px}
 .kachel .l{font-size:11.5px;color:var(--fg-2)}
 .kachel .w{font-size:26px;font-weight:600;letter-spacing:-.02em;margin-top:5px}
@@ -668,7 +770,7 @@ body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
 .kachel .ecke{position:absolute;right:13px;top:12px;font-size:13px;opacity:.8}
 
 /* ---------------- Verbrauchsband ---------------- */
-.band{background:linear-gradient(90deg,rgba(168,85,247,.10),rgba(255,77,77,.05) 45%,transparent);
+.band{background:linear-gradient(100deg,rgba(168,85,247,.17),rgba(91,141,239,.10) 42%,rgba(16,24,40,.5));
   border:1px solid var(--line);border-radius:13px;padding:14px 16px;margin-bottom:16px;
   display:grid;gap:14px;grid-template-columns:1fr}
 @media(min-width:1100px){.band{grid-template-columns:270px repeat(3,minmax(0,1fr))}}
@@ -704,7 +806,7 @@ body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
 .board{display:grid;gap:12px;grid-template-columns:repeat(4,minmax(0,1fr));align-items:start}
 @media(max-width:1200px){.board{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:700px){.board{grid-template-columns:minmax(0,1fr)}}
-.spalte{background:var(--flaeche);border:1px solid var(--line);border-radius:14px;
+.spalte{background:rgba(11,17,31,.66);border:1px solid var(--line);border-radius:14px;
   display:flex;flex-direction:column;overflow:hidden}
 .spalte.tot{box-shadow:inset 0 1px 0 rgba(255,77,77,.18)}
 .sp-kopf{display:flex;align-items:center;gap:10px;padding:13px 14px;border-bottom:1px solid var(--line)}
@@ -733,7 +835,7 @@ body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
 .leer{color:var(--dim);font-size:11.5px;text-align:center;padding:22px 8px}
 
 /* ---------------- Karte ---------------- */
-.karte{background:var(--karte);border:1px solid var(--line);border-radius:11px;
+.karte{background:rgba(16,24,40,.9);border:1px solid var(--line);border-radius:11px;
   padding:11px 12px 9px;display:flex;flex-direction:column;gap:7px;cursor:pointer;position:relative}
 .karte:hover{background:var(--karte-2);border-color:var(--line-2)}
 .spalte.live .karte{border-color:rgba(61,220,132,.28);
@@ -801,7 +903,46 @@ body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
 """
 
 JS = r"""
-function hole(pfad, cb){ fetch(pfad).then(function(r){return r.json()}).then(cb).catch(function(){cb({ok:false})}); }
+var TOKEN = document.body.getAttribute('data-token') || '';
+var NUR_LESEN = document.body.getAttribute('data-nurlesen') === '1';
+
+function hole(pfad, cb, koerper){
+  if(NUR_LESEN){ alert('Statischer Schnappschuss: Aktionen brauchen den Server.'); cb({ok:false}); return; }
+  fetch(pfad, {
+    method: 'POST',
+    headers: {'X-Dashboard-Token': TOKEN},
+    body: koerper === undefined ? null : koerper
+  }).then(function(r){return r.json()}).then(cb).catch(function(){cb({ok:false})});
+}
+
+// ---- Entwuerfe ueberleben jedes Neuladen ----
+function entwurfSchluessel(sid){ return 'entwurf:' + sid; }
+function entwurfLesen(sid){ try { return localStorage.getItem(entwurfSchluessel(sid)) || ''; } catch(e){ return ''; } }
+function entwurfSchreiben(sid, t){ try { t ? localStorage.setItem(entwurfSchluessel(sid), t) : localStorage.removeItem(entwurfSchluessel(sid)); } catch(e){} }
+
+document.querySelectorAll('.karte').forEach(function(k){
+  var sid = k.getAttribute('data-sid');
+  var t = k.querySelector('textarea');
+  if(!t || !sid) return;
+  var alt = entwurfLesen(sid);
+  if(alt){ t.value = alt; k.classList.add('offen'); }
+  t.addEventListener('input', function(){ entwurfSchreiben(sid, t.value); });
+});
+
+// ---- Selbst nachladen, aber nie mitten im Tippen ----
+function darfNachladen(){
+  var a = document.activeElement;
+  if(a && (a.tagName === 'TEXTAREA' || a.tagName === 'INPUT')) return false;
+  if(document.querySelector('.blende.an')) return false;
+  var offen = document.querySelectorAll('.karte.offen textarea');
+  for(var i = 0; i < offen.length; i++){ if((offen[i].value || '').trim()) return false; }
+  var q = document.getElementById('q');
+  if(q && q.value.trim()) return false;
+  return true;
+}
+if(!NUR_LESEN){
+  setInterval(function(){ if(darfNachladen()) location.reload(); }, 20000);
+}
 function blitz(k, kl){ k.classList.add(kl); setTimeout(function(){k.classList.remove(kl)}, 1200); }
 function dialog(an){ document.getElementById('blende').classList.toggle('an', an); }
 
@@ -835,12 +976,11 @@ document.addEventListener('click', function(e){
       var t2 = karte.querySelector('textarea'); var txt = (t2.value||'').trim();
       if(!txt){ karte.classList.add('offen'); t2.focus(); return; }
       wz.textContent = 'sendet…';
-      fetch('/antwort?id=' + encodeURIComponent(sid), {method:'POST', body: txt})
-        .then(function(r){return r.json()}).then(function(d){
-          wz.textContent = 'senden';
-          if(d.ok){ t2.value=''; karte.classList.remove('offen'); blitz(karte,'oeffnet'); }
-          else { blitz(karte,'fehler'); alert(d.fehler || 'fehlgeschlagen'); }
-        });
+      hole('/antwort?id=' + encodeURIComponent(sid), function(d){
+        wz.textContent = 'senden';
+        if(d.ok){ t2.value=''; entwurfSchreiben(sid, ''); karte.classList.remove('offen'); blitz(karte,'oeffnet'); }
+        else { blitz(karte,'fehler'); alert(d.fehler || 'fehlgeschlagen'); }
+      }, txt);
     } else if(art === 'zurueck'){
       hole('/erledigt?aus=1&id=' + encodeURIComponent(sid), function(d){
         if(d.ok){ karte.style.transition='opacity .25s'; karte.style.opacity=0;
@@ -990,7 +1130,7 @@ def _ring(anteil, farbe, groesse=52):
             'stroke-linecap="round" stroke-dasharray="%.1f %.1f" '
             'transform="rotate(-90 %d %d)"/>'
             '<text x="%d" y="%d" text-anchor="middle" dominant-baseline="central" '
-            'fill="#E7EAF2" font-size="12" font-family="Inter,sans-serif" '
+            'fill="#E7EAF2" font-size="12" font-family="-apple-system,sans-serif" '
             'font-weight="600">%d%%</text></svg>'
             % (groesse, groesse, groesse//2, groesse//2, r, groesse//2, groesse//2, r,
                farbe, u * min(1.0, anteil), u, groesse//2, groesse//2,
@@ -1039,11 +1179,9 @@ def build(sessions, platz=0, archiv=False):
     p.append("<!doctype html><html lang='de'><head><meta charset='utf-8'>")
     p.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
     p.append("<title>Claude Sessions</title>")
-    p.append("<link rel='preconnect' href='https://fonts.googleapis.com'>")
-    p.append("<link rel='preconnect' href='https://fonts.gstatic.com' crossorigin>")
-    p.append("<link rel='stylesheet' href='https://fonts.googleapis.com/css2?"
-             "family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap'>")
-    p.append("<style>%s</style></head><body>" % CSS)
+    p.append("<style>%s</style></head>" % CSS)
+    p.append("<body data-token='%s' data-nurlesen='%s'>"
+             % (e(TOKEN if not NUR_LESEN else ""), "1" if NUR_LESEN else "0"))
 
     # ---------------- Seitenleiste ----------------
     p.append("<aside class='seite'>")
@@ -1158,6 +1296,10 @@ def build(sessions, platz=0, archiv=False):
     p.append("<div class='rechts'><span class='wahl'>Stand %s</span></div></div>" % e(uhr))
 
     # ---------------- Board ----------------
+    if NUR_LESEN:
+        p.append("<div class='band' style='display:block'>Statischer Schnappschuss. "
+                 "Terminal oeffnen, Antworten und Archiv brauchen den Server: "
+                 "<b>python3 dash.py --serve</b></div>")
     p.append("<div class='board'>")
     for k, label, ic in SPALTEN:
         gr = [s for s in sessions if s["zustand"][0] == k]
@@ -1172,7 +1314,7 @@ def build(sessions, platz=0, archiv=False):
         for s in gr:
             titel = s["title"] or s["first_prompt"] or "ohne Titel"
             projekt = os.path.basename((s["cwd"] or "?").rstrip("/")) or "?"
-            cmd = "cd '%s' && claude -r %s" % (s["cwd"] or "~", s["id"])
+            cmd = fortsetzen_befehl(s)
             if s["last_role"] == "user" and s["last_user"]:
                 txt = "<em>DU&nbsp;</em>" + e(s["last_user"][:230])
             elif s["last_asst"]:
@@ -1194,22 +1336,24 @@ def build(sessions, platz=0, archiv=False):
                 anteil = min(1.0, (jetzt.timestamp() - s["mtime"]) / 14400.0)
                 p.append("<div class='balken' title='Wartezeit, voll nach 4 Stunden'>"
                          "<i style='width:%d%%'></i></div>" % int(anteil * 100))
-            p.append("<div class='antwort'><textarea placeholder='Antwort an diese Sitzung…'>"
-                     "</textarea><div class='hinweis'>Wird ohne Terminal eingespielt. "
-                     "Geht nur, wenn kein Fenster offen ist.</div></div>")
+            if not NUR_LESEN:
+                p.append("<div class='antwort'><textarea placeholder='Antwort an diese Sitzung…'>"
+                         "</textarea><div class='hinweis'>Wird ohne Terminal eingespielt. "
+                         "Geht nur, wenn kein Tab dazu offen ist.</div></div>")
             p.append("<div class='k-unten'><span>%s</span><span class='geld'>%s</span>"
                      "<span class='marke-tag'>%s</span><div class='werkzeug'>"
                      % (e(rel(s["mtime"])), e(_geld(s["kosten"])), e(projekt)))
-            if k in ("tot", "kalt"):
+            if k in ("tot", "kalt") and not NUR_LESEN:
                 p.append("<button class='wz' data-art='antworten'>antw.</button>"
                          "<button class='wz' data-art='senden'>senden</button>")
             p.append("<button class='wz' data-art='kopieren'>kopieren</button>")
-            if archiv:
-                p.append("<button class='wz' data-art='zurueck'>zurückholen</button>")
-            else:
-                p.append("<button class='wz' data-art='erledigt'>erledigt</button>")
-            if k == "kalt":
-                p.append("<button class='wz' data-art='papierkorb'>&#9003;</button>")
+            if not NUR_LESEN:
+                if archiv:
+                    p.append("<button class='wz' data-art='zurueck'>zurückholen</button>")
+                else:
+                    p.append("<button class='wz' data-art='erledigt'>erledigt</button>")
+                if k == "kalt":
+                    p.append("<button class='wz' data-art='papierkorb'>&#9003;</button>")
             p.append("</div></div></article>")
         p.append("</div><div class='sp-fuss'><button data-neu='1'>+ Neue Session</button>"
                  "</div></section>")
@@ -1256,6 +1400,7 @@ def build(sessions, platz=0, archiv=False):
     return "".join(p)
 # ---------------------------------------------------------------- main
 def schreiben():
+    os.makedirs(DATEN, exist_ok=True)
     doc = build(collect(), platz_gesamt())
     with open(OUT, "w", encoding="utf-8") as fh:
         fh.write(doc)
@@ -1266,6 +1411,9 @@ def serve(port=8787):
     from http.server import BaseHTTPRequestHandler, HTTPServer
     from urllib.parse import urlparse, parse_qs
 
+    erlaubte_hosts = {"localhost:%d" % port, "127.0.0.1:%d" % port}
+    erlaubte_origins = {"http://localhost:%d" % port, "http://127.0.0.1:%d" % port}
+
     def finde(sid):
         for x in collect(mit_erledigt=True):
             if x["id"] == sid:
@@ -1273,6 +1421,9 @@ def serve(port=8787):
         return None
 
     class H(BaseHTTPRequestHandler):
+        server_version = "claude-dashboard"
+        sys_version = ""
+
         def _json(self, obj, code=200):
             body = json.dumps(obj).encode("utf-8")
             self.send_response(code)
@@ -1282,22 +1433,40 @@ def serve(port=8787):
             self.end_headers()
             self.wfile.write(body)
 
+        def _abgelehnt(self, grund, code=403):
+            warn("abgewiesen: %s (%s)" % (grund, self.path))
+            return self._json({"ok": False, "fehler": grund}, code)
+
+        def _pruefen(self):
+            """Gegen Zugriffe von fremden Seiten und aus anderen Programmen."""
+            host = (self.headers.get("Host") or "").strip()
+            if host not in erlaubte_hosts:
+                return "unerwarteter Host"
+            herkunft = self.headers.get("Origin")
+            if herkunft and herkunft not in erlaubte_origins:
+                return "unerwartete Herkunft"
+            if (self.headers.get("X-Dashboard-Token") or "") != TOKEN:
+                return "fehlender oder falscher Token"
+            return None
+
         def _sid(self):
             return (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
 
         def do_POST(self):
             weg = urlparse(self.path).path
-            if weg != "/antwort":
-                return self._json({"ok": False, "fehler": "unbekannt"}, 404)
-            laenge = int(self.headers.get("Content-Length") or 0)
-            text = self.rfile.read(min(laenge, 8192)).decode("utf-8", "ignore")
-            s = finde(self._sid())
-            if not s:
-                return self._json({"ok": False, "fehler": "unbekannte Sitzung"}, 404)
-            return self._json(antworte(s, text))
+            fehler = self._pruefen()
+            if fehler:
+                return self._abgelehnt(fehler)
 
-        def do_GET(self):
-            weg = urlparse(self.path).path
+            if weg == "/antwort":
+                laenge = int(self.headers.get("Content-Length") or 0)
+                if laenge > 8192:
+                    return self._json({"ok": False, "fehler": "Text zu lang"}, 413)
+                text = self.rfile.read(laenge).decode("utf-8", "ignore")
+                s = finde(self._sid())
+                if not s:
+                    return self._json({"ok": False, "fehler": "unbekannte Sitzung"}, 404)
+                return self._json(antworte(s, text))
 
             if weg == "/oeffnen":
                 s = finde(self._sid())
@@ -1318,30 +1487,48 @@ def serve(port=8787):
                 return self._json(budget_setzen((q.get("tag") or ["0"])[0],
                                                 (q.get("woche") or ["0"])[0]))
 
-            if weg == "/neu":
-                _osa('tell application "Terminal"\n  do script "claude"\n  activate\nend tell')
-                return self._json({"ok": True})
-
             if weg == "/papierkorb":
                 s = finde(self._sid())
                 if not s:
                     return self._json({"ok": False, "fehler": "unbekannte Sitzung"}, 404)
                 return self._json(in_papierkorb(s))
 
+            if weg == "/zurueckholen":
+                name = (parse_qs(urlparse(self.path).query).get("datei") or [""])[0]
+                if "/" in name or "\\" in name or not name.endswith(".jsonl"):
+                    return self._json({"ok": False, "fehler": "ungueltiger Name"}, 400)
+                return self._json(aus_papierkorb(name))
+
+            if weg == "/neu":
+                out, rc = _osa('tell application "Terminal"\n'
+                               '  do script %s\n  activate\nend tell'
+                               % json.dumps(shlex.quote(CLAUDE)))
+                if rc != 0:
+                    return self._json({"ok": False, "fehler": out[:200]}, 500)
+                return self._json({"ok": True})
+
+            return self._json({"ok": False, "fehler": "unbekannt"}, 404)
+
+        def do_GET(self):
+            weg = urlparse(self.path).path
+            if weg not in ("/", "/index.html"):
+                return self._json({"ok": False, "fehler": "unbekannt"}, 404)
+            host = (self.headers.get("Host") or "").strip()
+            if host not in erlaubte_hosts:
+                return self._abgelehnt("unerwarteter Host")
+
             archiv = (parse_qs(urlparse(self.path).query).get("archiv") or ["0"])[0] == "1"
             if archiv:
-                alle = collect(mit_erledigt=True)
-                liste = [x for x in alle if x.get("erledigt")]
+                liste = [x for x in collect(mit_erledigt=True) if x.get("erledigt")]
             else:
                 liste = collect()
-            doc = build(liste, platz_gesamt(), archiv)
-            if not archiv:
-                doc = doc.replace("</head>", "<meta http-equiv='refresh' content='20'></head>", 1)
-            body = doc.encode("utf-8")
+            body = build(liste, platz_gesamt(), archiv).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
 
@@ -1351,11 +1538,11 @@ def serve(port=8787):
     threading.Thread(target=eskalation_schleife, daemon=True).start()
 
     url = "http://localhost:%d/" % port
-    print("dashboard laeuft auf %s   (Strg+C beendet)" % url)
+    print("dashboard laeuft auf %s   (Strg+C beendet)" % url, flush=True)
     try:
         subprocess.run(["open", url], check=False)
-    except Exception:
-        pass
+    except Exception as ex:
+        warn("Browser liess sich nicht oeffnen: %s" % ex)
     HTTPServer(("127.0.0.1", port), H).serve_forever()
 
 
@@ -1363,6 +1550,8 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if "--demo" in args:
         DEMO = True
+    if "--serve" not in args:
+        NUR_LESEN = True
     if "--serve" in args:
         i = args.index("--serve")
         port = int(args[i + 1]) if len(args) > i + 1 and args[i + 1].isdigit() else 8787
