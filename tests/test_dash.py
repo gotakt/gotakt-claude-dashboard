@@ -326,6 +326,23 @@ class LifecycleVorrang(unittest.TestCase):
         self.assertEqual(z[0], "tot")
         self.assertEqual(z[3], "hergeleitet")
 
+    def test_bereit_wird_als_hook_angezeigt(self):
+        # Ein frisches SessionStart soll sichtbar vom Hook kommen und nicht
+        # sofort wieder auf die Herleitung zurueckfallen.
+        z = d.status(self._inf("assistant", 600), self._leben("bereit", 30))
+        self.assertEqual(z[0], "warte")
+        self.assertEqual(z[1], "BEREIT")
+        self.assertEqual(z[3], "hook")
+
+    def test_bereit_veraltet_nach_zehn_minuten(self):
+        z = d.status(self._inf("user", 600), self._leben("bereit", 20 * 60))
+        self.assertEqual(z[3], "hergeleitet")
+        self.assertEqual(z[0], "tot")
+
+    def test_jeder_haltbare_zustand_hat_eine_spalte(self):
+        ohne = set(d.HALTBAR) - set(d.LEBEN_ZU_SPALTE)
+        self.assertEqual(ohne, set(), "Zustand ohne Spalte waere ein toter Pfad")
+
     def test_beendet_veraltet_nie(self):
         z = d.status(self._inf("assistant", 600), self._leben("beendet", 30 * 86400))
         self.assertEqual(z[0], "kalt")

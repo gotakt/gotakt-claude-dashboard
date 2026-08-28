@@ -341,6 +341,11 @@ HALTBAR = {
 # Zustand aus dem Hook -> (Spalte, Beschriftung, Rang)
 LEBEN_ZU_SPALTE = {
     "freigabe": ("freigabe", "BRAUCHT FREIGABE", 0),
+    # Nach SessionStart laeuft noch nichts, die Sitzung steht nur bereit. Sie
+    # landet deshalb bei den wartenden, aber mit eigener Beschriftung, damit man
+    # frisch gestartet von fertig geantwortet unterscheiden kann. Nach zehn
+    # Minuten ohne weiteres Ereignis greift wieder die Herleitung.
+    "bereit":   ("warte",    "BEREIT",           2),
     "arbeitet": ("live",     "LAEUFT GERADE",    3),
     "wartet":   ("warte",    "WARTET AUF DICH",  2),
     "fehler":   ("tot",      "TURN ABGEBROCHEN", 1),
