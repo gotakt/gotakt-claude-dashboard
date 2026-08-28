@@ -23,6 +23,13 @@ TOKEN  = secrets.token_urlsafe(32)
 SPERRE = threading.RLock()
 NUR_LESEN = False
 
+# AppleScript gibt es nur auf macOS, und auch dort nur mit einer Sitzung im
+# Vordergrund. Auf einem Bauknecht ohne Oberfläche haengt jeder Aufruf bis zum
+# Zeitlimit. Deshalb hier einmal entscheiden statt bei jedem Aufruf zu warten.
+KEIN_TERMINAL = (os.environ.get("CLAUDE_DASH_KEIN_TERMINAL") == "1"
+                 or sys.platform != "darwin"
+                 or not shutil.which("osascript"))
+
 
 def warn(text):
     """Fehler sichtbar machen statt verschlucken."""
@@ -513,7 +520,12 @@ def platz_gesamt():
 
 
 # ---------------------------------------------------------------- terminal
+_TABS_CACHE = {"zeit": 0.0, "wert": []}
+
+
 def _osa(script):
+    if KEIN_TERMINAL:
+        return "", 1
     try:
         r = subprocess.run(["osascript", "-e", script],
                            capture_output=True, text=True, timeout=12)
@@ -529,8 +541,16 @@ def _norm(t):
     return t.lower()
 
 
-def terminal_tabs():
-    """[(fenster_id, tab_nummer, titel)] ueber alle Fenster und Tabs."""
+def terminal_tabs(hoechstalter=2.0):
+    """[(fenster_id, tab_nummer, titel)] ueber alle Fenster und Tabs.
+
+    Kurz zwischengespeichert: Beim Bauen einer Seite wird die Liste mehrfach
+    gebraucht, und jeder AppleScript-Aufruf kostet spuerbar Zeit.
+    """
+    if KEIN_TERMINAL:
+        return []
+    if time.time() - _TABS_CACHE["zeit"] < hoechstalter:
+        return _TABS_CACHE["wert"]
     out, rc = _osa(
         'tell application "Terminal"\n'
         '  set aus to ""\n'
@@ -555,6 +575,8 @@ def terminal_tabs():
             if len(teile) >= 3 and teile[0].strip().isdigit() and teile[1].strip().isdigit():
                 tabs.append((int(teile[0].strip()), int(teile[1].strip()),
                              "|#|".join(teile[2:]).strip()))
+    _TABS_CACHE["zeit"] = time.time()
+    _TABS_CACHE["wert"] = tabs
     return tabs
 
 
@@ -1705,10 +1727,11 @@ def serve(port=8787):
 
     url = "http://localhost:%d/" % port
     print("dashboard laeuft auf %s   (Strg+C beendet)" % url, flush=True)
-    try:
-        subprocess.run(["open", url], check=False)
-    except Exception as ex:
-        warn("Browser liess sich nicht oeffnen: %s" % ex)
+    if not KEIN_TERMINAL:
+        try:
+            subprocess.run(["open", url], check=False, timeout=10)
+        except Exception as ex:
+            warn("Browser liess sich nicht oeffnen: %s" % ex)
     HTTPServer(("127.0.0.1", port), H).serve_forever()
 
 

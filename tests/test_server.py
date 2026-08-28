@@ -7,6 +7,10 @@ Server geprueft, nicht gegen den Quelltext.
 import json, os, re, sys, socket, threading, time, unittest, importlib.util
 import urllib.request, urllib.error
 
+# Ohne Oberflaeche haengt jeder AppleScript-Aufruf bis zum Zeitlimit. Fuer die
+# Servertests brauchen wir das Terminal nicht, also vorher abschalten.
+os.environ.setdefault("CLAUDE_DASH_KEIN_TERMINAL", "1")
+
 WURZEL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 spec = importlib.util.spec_from_file_location("dash", os.path.join(WURZEL, "dash.py"))
 d = importlib.util.module_from_spec(spec)
@@ -118,6 +122,17 @@ class Server(unittest.TestCase):
     def test_fremder_host_auch_bei_der_seite(self):
         code, _, _ = self._anfrage("/", methode="GET", kopf={"Host": "boese.example"})
         self.assertEqual(code, 403)
+
+
+class OhneTerminal(unittest.TestCase):
+    def test_applescript_wird_uebersprungen(self):
+        self.assertTrue(d.KEIN_TERMINAL)
+        self.assertEqual(d.terminal_tabs(), [])
+        self.assertEqual(d._osa("egal")[1], 1)
+
+    def test_zuordnung_faellt_sauber_aus(self):
+        self.assertIsNone(d.finde_tab({"title": "irgendwas"}))
+        self.assertFalse(d.tab_mehrdeutig({"title": "irgendwas"}))
 
 
 class KeineExternenVerweise(unittest.TestCase):
