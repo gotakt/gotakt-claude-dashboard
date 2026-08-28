@@ -9,7 +9,7 @@ Grundsaetze:
   - vor jeder Aenderung eine Sicherung
   - ist die Datei kein gueltiges JSON, wird abgebrochen statt geraten
 """
-import os, sys, json, shutil, datetime
+import os, sys, json, shutil, shlex, datetime
 
 SETTINGS = os.path.expanduser("~/.claude/settings.json")
 HOOKS    = os.path.dirname(os.path.abspath(__file__))
@@ -20,7 +20,10 @@ EREIGNISSE = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
 
 
 def befehl(python, skript):
-    return "%s %s" % (python, os.path.join(HOOKS, skript))
+    """Der Befehl landet als Zeichenkette in settings.json und wird von einer
+    Shell ausgefuehrt. Leerzeichen oder Apostrophe im Pfad wuerden ihn sonst in
+    mehrere Argumente zerlegen, etwa unter /Users/x/My Projects/."""
+    return "%s %s" % (shlex.quote(python), shlex.quote(os.path.join(HOOKS, skript)))
 
 
 def enthaelt(eintraege, cmd):

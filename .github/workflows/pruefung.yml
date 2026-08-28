@@ -8,17 +8,35 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "${{ matrix.python }}"
       - name: Syntax
         run: |
           python -m py_compile dash.py hooks/stop-notify.py hooks/lifecycle.py hooks/install-hooks.py
       - name: Tests
         run: python -m unittest discover -s tests -v
-      - name: Keine externen Anfragen im erzeugten HTML
+      - name: Hinweis
         run: |
-          ! grep -rE "googleapis|gstatic|https?://(?!localhost|127\.0\.0\.1)" dash.py \
-            --include=dash.py -P || (echo "externer Verweis gefunden" && exit 1)
+          echo "Die Pruefung auf externe Verweise steckt in tests/test_server.py"
+          echo "und arbeitet am erzeugten HTML statt am Quelltext."
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Syntax
+        run: python -m py_compile dash.py hooks/*.py
+      - name: Tests
+        run: python -m unittest discover -s tests
+      - name: Installer trocken pruefen
+        run: bash -n install.sh

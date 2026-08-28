@@ -7,7 +7,8 @@ Zustandssatz nach ~/.claude/dashboard/lifecycle/<session_id>.json.
 
 Bewusst enthalten ist nur, was fuer die Anzeige eines Zustands noetig ist:
 Sitzungskennung, Arbeitsverzeichnis, Zustand, letztes Ereignis, Zeitpunkt und
-der Name des laufenden Werkzeugs. Prompttexte, Werkzeugeingaben und Ergebnisse
+der Name des laufenden Werkzeugs. Auch der Pfad zum Protokoll bleibt draussen,
+das Dashboard findet es ueber die Kennung. Prompttexte, Werkzeugeingaben und Ergebnisse
 werden ausdruecklich nicht uebernommen. Das Transkript ist schon die eine
 Kopie dieser Daten, eine zweite waere nur ein zusaetzliches Leck.
 
@@ -97,8 +98,9 @@ def main():
         satz.setdefault("started_at", jetzt())
         if ev.get("cwd"):
             satz["cwd"] = ev["cwd"]
-        if ev.get("transcript_path"):
-            satz["transcript_path"] = ev["transcript_path"]
+        # transcript_path wird bewusst nicht gespeichert. Das Dashboard findet
+        # das Protokoll ohnehin ueber die Sitzungskennung, und was nicht in
+        # einer zweiten Datei steht, kann dort auch nicht auslaufen.
 
         satz["last_event"] = name
         satz["last_event_at"] = jetzt()
@@ -127,7 +129,7 @@ def main():
 
         # Sicherheitsnetz: nichts speichern, was Inhalte tragen koennte.
         for verboten in ("tool_input", "tool_response", "prompt", "message",
-                         "content", "command"):
+                         "content", "command", "transcript_path"):
             satz.pop(verboten, None)
 
         sicher_schreiben(pfad, satz)

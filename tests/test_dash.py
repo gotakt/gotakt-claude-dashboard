@@ -15,11 +15,11 @@ d = lade()
 
 
 def schreibe(zeilen):
-    fh = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
-    for z in zeilen:
-        fh.write((z if isinstance(z, str) else json.dumps(z)) + "\n")
-    fh.close()
-    return fh.name
+    fd, pfad = tempfile.mkstemp(suffix=".jsonl")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        for z in zeilen:
+            fh.write((z if isinstance(z, str) else json.dumps(z)) + "\n")
+    return pfad
 
 
 def grund(rolle, text, ts="2026-08-28T10:00:00.000Z"):
@@ -382,10 +382,10 @@ class HookInstallation(unittest.TestCase):
         return n
 
     def test_idempotent_und_fremdes_bleibt(self):
-        json.dump({"model": "opus", "theme": "dark",
-                   "hooks": {"Stop": [{"hooks": [{"type": "command",
-                                                  "command": "python3 stop-notify.py"}]}]}},
-                  open(self.datei, "w", encoding="utf-8"))
+        with open(self.datei, "w", encoding="utf-8") as fh:
+            json.dump({"model": "opus", "theme": "dark",
+                       "hooks": {"Stop": [{"hooks": [{"type": "command",
+                                                      "command": "python3 stop-notify.py"}]}]}}, fh)
         self.assertEqual(self._lauf().returncode, 0)
         eins = self._cfg()
         self.assertEqual(self._lauf().returncode, 0)
@@ -397,8 +397,32 @@ class HookInstallation(unittest.TestCase):
         self.assertEqual(zwei["model"], "opus")
         self.assertEqual(zwei["theme"], "dark")
 
+    def test_pfade_mit_leerzeichen_werden_zitiert(self):
+        """Ein Pfad wie /Users/x/My Projects/ darf den Befehl nicht zerlegen."""
+        import shlex, importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "ih", os.path.join(WURZEL, "hooks", "install-hooks.py"))
+        ih = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ih)
+        cmd = ih.befehl("/usr/bin/python3", "lifecycle.py")
+        teile = shlex.split(cmd)
+        self.assertEqual(len(teile), 2, "Befehl zerfaellt in zu viele Argumente: %r" % cmd)
+        self.assertTrue(teile[1].endswith("lifecycle.py"))
+
+        alt = ih.HOOKS
+        try:
+            ih.HOOKS = "/Users/x/My Projects/gotakt's tools"
+            cmd = ih.befehl("/usr/bin/python3", "lifecycle.py")
+            teile = shlex.split(cmd)
+            self.assertEqual(len(teile), 2, "Leerzeichen zerlegen den Befehl: %r" % cmd)
+            self.assertEqual(teile[1], "/Users/x/My Projects/gotakt's tools/lifecycle.py")
+        finally:
+            ih.HOOKS = alt
+
     def test_kaputte_datei_wird_nicht_angefasst(self):
-        open(self.datei, "w").write("{kein json")
+        with open(self.datei, "w", encoding="utf-8") as fh:
+            fh.write("{kein json")
         r = self._lauf()
         self.assertEqual(r.returncode, 1)
-        self.assertEqual(open(self.datei).read(), "{kein json")
+        with open(self.datei, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "{kein json")

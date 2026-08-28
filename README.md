@@ -114,8 +114,6 @@ The script finds `python3`, `claude` and the repository path itself, writes the
 plist, creates `logs/` and starts the service. `KeepAlive` is on, so it comes back
 if it dies.
 
-`KeepAlive` is on, so the service comes back on its own if it dies. To remove it:
-
 ```bash
 launchctl bootout gui/$(id -u)/de.gotakt.claude-dashboard
 rm ~/Library/LaunchAgents/de.gotakt.claude-dashboard.plist
