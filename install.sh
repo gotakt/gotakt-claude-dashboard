@@ -84,4 +84,7 @@ echo "Hooks eintragen ..."
 echo
 echo "Installiert. Das Dashboard laeuft auf http://localhost:$PORT"
 echo "Protokolle : $REPO/logs/"
-echo "Entfernen  : launchctl bootout gui/\$(id -u)/$LABEL && rm $PLIST"
+echo "Entfernen  : launchctl bootout gui/\$(id -u)/$LABEL"
+echo "             rm $PLIST"
+echo "             $PY $REPO/hooks/install-hooks.py --entfernen"
+echo "             (der dritte Schritt traegt die Hooks aus settings.json aus)"
