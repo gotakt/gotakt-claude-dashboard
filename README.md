@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/gotakt/gotakt-claude-dashboard/actions/workflows/pruefung.yml">
     <img src="https://github.com/gotakt/gotakt-claude-dashboard/actions/workflows/pruefung.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/tests-63-3DDC84" alt="63 tests">
+  <img src="https://img.shields.io/badge/tests-75-3DDC84" alt="75 tests">
   <img src="https://img.shields.io/badge/dependencies-none-5B8DEF" alt="no dependencies">
   <img src="https://img.shields.io/badge/python-3.9%20%7C%203.11%20%7C%203.13-C084FC" alt="Python">
   <img src="https://img.shields.io/badge/platform-macOS-9AA5BF" alt="macOS">
@@ -75,12 +75,21 @@ python3 dash.py                # read-only snapshot, no actions
 python3 dash.py --demo         # same, every name and message replaced
 ```
 
-Removing it again:
+Removing it again. Three steps, and the third one matters: the installer also
+writes hook entries into `~/.claude/settings.json`, and those point at this
+repository. Leave them behind, delete the folder, and every Claude Code session
+afterwards runs a hook that is no longer there.
 
 ```bash
 launchctl bootout gui/$(id -u)/de.gotakt.claude-dashboard
 rm ~/Library/LaunchAgents/de.gotakt.claude-dashboard.plist
+python3 hooks/install-hooks.py --entfernen
 ```
+
+Run the third one from the repository, before you delete it. It removes only
+the entries that call this repository's `lifecycle.py` and leaves every other
+hook in the same event untouched; it writes a timestamped backup first, and it
+does nothing at all if there is nothing of ours to remove.
 
 ## Requirements
 

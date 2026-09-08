@@ -44,3 +44,12 @@ jobs:
         run: python -m unittest discover -s tests
       - name: Installer trocken pruefen
         run: bash -n install.sh
+
+      # Der Kernvertrag der Deinstallation: es darf kein fremder Hook
+      # mitgehen. Das Skript macht die Erkennung absichtlich kaputt und
+      # verlangt, dass genau der dafuer zustaendige Test rot wird — ein
+      # blosser Fehlschlag zaehlt nicht. Laeuft nur hier, einmal: die
+      # Hook-Logik ist plattformunabhaengig, dreimal dasselbe zu pruefen
+      # gewinnt nichts.
+      - name: Gegenprobe — beim Entfernen darf kein fremder Hook mitgehen
+        run: ./tests/sabotage-entfernen.sh

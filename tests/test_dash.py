@@ -426,3 +426,196 @@ class HookInstallation(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         with open(self.datei, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "{kein json")
+
+
+class HookEntfernung(unittest.TestCase):
+    """Nach der dokumentierten Deinstallation darf kein Dashboard-Hook
+    zurueckbleiben — und kein fremder darf dabei mitgehen.
+
+    Der Zustand vor dieser Klasse: `install.sh` trug neun Hooks ein, und der
+    im README beschriebene Entfernungsweg (LaunchAgent, plist) liess alle
+    neun stehen. Wer danach das Repository loeschte, hatte in jeder
+    Claude-Sitzung neun Hooks, die ins Leere zeigten.
+    """
+
+    FREMD = "/usr/local/bin/mein-eigener-hook.sh"
+
+    def setUp(self):
+        self.heim = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.heim, ".claude"))
+        self.datei = os.path.join(self.heim, ".claude", "settings.json")
+
+    def _lauf(self, *args):
+        return _sp.run([sys.executable, os.path.join(WURZEL, "hooks", "install-hooks.py")] + list(args),
+                       text=True, capture_output=True,
+                       env=dict(os.environ, HOME=self.heim))
+
+    def _cfg(self):
+        with open(self.datei, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def _zaehle(self, cfg, teil):
+        n = 0
+        for liste in (cfg.get("hooks") or {}).values():
+            if not isinstance(liste, list):
+                continue
+            for g in liste:
+                for h in (g or {}).get("hooks", []) or []:
+                    if teil in (h.get("command") or ""):
+                        n += 1
+        return n
+
+    def _schreibe(self, cfg):
+        with open(self.datei, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+
+    # 1 ---------------------------------------------------------------
+    def test_leere_einstellungen_installieren(self):
+        self._schreibe({})
+        self.assertEqual(self._lauf().returncode, 0)
+        self.assertEqual(self._zaehle(self._cfg(), "lifecycle.py"), 9)
+
+    # 2 ---------------------------------------------------------------
+    def test_zweites_installieren_erzeugt_keine_duplikate(self):
+        self._schreibe({})
+        self.assertEqual(self._lauf().returncode, 0)
+        r = self._lauf()
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("eingetragen: nichts", r.stdout)
+        self.assertEqual(self._zaehle(self._cfg(), "lifecycle.py"), 9)
+
+    # 3 ---------------------------------------------------------------
+    def test_fremder_hook_bleibt_beim_entfernen(self):
+        """Der Kernvertrag. Wird er verletzt, nimmt eine Deinstallation
+        jemandem seine eigene Einrichtung weg."""
+        self._schreibe({
+            "model": "opus",
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": self.FREMD}]}]},
+        })
+        self.assertEqual(self._lauf().returncode, 0)
+        self.assertEqual(self._zaehle(self._cfg(), "lifecycle.py"), 9)
+
+        r = self._lauf("--entfernen")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        nachher = self._cfg()
+        self.assertEqual(self._zaehle(nachher, "lifecycle.py"), 0,
+                         "Dashboard-Hooks sind zurueckgeblieben")
+        self.assertEqual(self._zaehle(nachher, "mein-eigener-hook"), 1,
+                         "fremder Hook wurde mitentfernt")
+        self.assertEqual(nachher["model"], "opus", "fremde Einstellung verloren")
+
+    def test_fremder_hook_im_selben_ereignis_ueberlebt(self):
+        """Fremd und eigen in EINER Gruppe — der schwierigere Fall."""
+        self._schreibe({"hooks": {}})
+        self.assertEqual(self._lauf().returncode, 0)
+        cfg = self._cfg()
+        cfg["hooks"]["Stop"][0]["hooks"].append({"type": "command", "command": self.FREMD})
+        self._schreibe(cfg)
+
+        self.assertEqual(self._lauf("--entfernen").returncode, 0)
+        nachher = self._cfg()
+        self.assertEqual(self._zaehle(nachher, "lifecycle.py"), 0)
+        self.assertEqual(self._zaehle(nachher, "mein-eigener-hook"), 1,
+                         "fremder Hook in gemeinsamer Gruppe verloren")
+
+    def test_gruppe_mit_matcher_bleibt_stehen(self):
+        """Eine Gruppe, die ausser `hooks` noch etwas traegt, wird nicht
+        weggeworfen — sonst ginge eine fremde Angabe verloren."""
+        self._schreibe({"hooks": {}})
+        self.assertEqual(self._lauf().returncode, 0)
+        cfg = self._cfg()
+        cfg["hooks"]["PreToolUse"][0]["matcher"] = "Bash"
+        self._schreibe(cfg)
+
+        self.assertEqual(self._lauf("--entfernen").returncode, 0)
+        nachher = self._cfg()
+        self.assertEqual(self._zaehle(nachher, "lifecycle.py"), 0)
+        self.assertEqual(nachher["hooks"]["PreToolUse"][0]["matcher"], "Bash",
+                         "matcher einer fremden Gruppe verloren")
+
+    def test_leer_gewordenes_ereignis_verschwindet(self):
+        self._schreibe({"hooks": {}})
+        self.assertEqual(self._lauf().returncode, 0)
+        self.assertEqual(self._lauf("--entfernen").returncode, 0)
+        self.assertEqual(self._cfg().get("hooks"), {},
+                         "leer gewordene Ereignisse blieben stehen")
+
+    def test_vorher_leeres_ereignis_bleibt(self):
+        """Was schon vorher leer dastand, ist nicht unseres."""
+        self._schreibe({"hooks": {"Notification": []}})
+        self.assertEqual(self._lauf().returncode, 0)
+        self.assertEqual(self._lauf("--entfernen").returncode, 0)
+        self.assertIn("Notification", self._cfg()["hooks"],
+                      "fremdes leeres Ereignis wurde aufgeraeumt")
+
+    # 4 ---------------------------------------------------------------
+    def test_entfernen_ohne_eigene_hooks_ist_folgenlos(self):
+        vorher = json.dumps({"model": "opus",
+                             "hooks": {"Stop": [{"hooks": [{"type": "command",
+                                                            "command": self.FREMD}]}]}},
+                            indent=2)
+        with open(self.datei, "w", encoding="utf-8") as fh:
+            fh.write(vorher)
+        r = self._lauf("--entfernen")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("entfernt: nichts", r.stdout)
+        with open(self.datei, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), vorher, "Datei wurde ohne Not angefasst")
+
+    def test_entfernen_ohne_settings_datei(self):
+        r = self._lauf("--entfernen")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(self.datei), "Datei wurde angelegt")
+
+    # 5 ---------------------------------------------------------------
+    def test_ungueltiges_json_bleibt_byteweise_unveraendert(self):
+        roh = b'{"model": "opus", kaputt\n'
+        with open(self.datei, "wb") as fh:
+            fh.write(roh)
+        for args in ([], ["--entfernen"]):
+            r = self._lauf(*args)
+            self.assertEqual(r.returncode, 1, "Abbruch erwartet bei %s" % (args or ["(einbauen)"],))
+            with open(self.datei, "rb") as fh:
+                self.assertEqual(fh.read(), roh, "kaputte Datei wurde veraendert")
+
+    def test_unbekanntes_argument_aendert_nichts(self):
+        self._schreibe({})
+        r = self._lauf("--alles-weg")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(self._cfg(), {})
+
+    # 6 ---------------------------------------------------------------
+    def test_fehlgeschlagenes_ersetzen_laesst_das_original_intakt(self):
+        """Der Grund fuer das atomare Schreiben. settings.json gehoert Claude
+        Code; eine halb geschriebene Fassung waere ein fremder Schaden."""
+        import importlib.util
+        vorher = json.dumps({"model": "opus"}, indent=2)
+        with open(self.datei, "w", encoding="utf-8") as fh:
+            fh.write(vorher)
+
+        alt_heim = os.environ.get("HOME")
+        os.environ["HOME"] = self.heim
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "ih_fehler", os.path.join(WURZEL, "hooks", "install-hooks.py"))
+            ih = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(ih)
+            self.assertEqual(ih.SETTINGS, self.datei)
+
+            echtes_replace = ih.os.replace
+            ih.os.replace = lambda *a, **k: (_ for _ in ()).throw(OSError("Platte voll"))
+            try:
+                with self.assertRaises(OSError):
+                    ih.eintragen()
+            finally:
+                ih.os.replace = echtes_replace
+        finally:
+            if alt_heim is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = alt_heim
+
+        with open(self.datei, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), vorher, "Original wurde beschaedigt")
+        rest = [f for f in os.listdir(os.path.dirname(self.datei)) if ".neu-" in f]
+        self.assertEqual(rest, [], "Nachbardatei blieb liegen: %s" % rest)
