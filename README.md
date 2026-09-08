@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/gotakt/gotakt-claude-dashboard/actions/workflows/pruefung.yml">
     <img src="https://github.com/gotakt/gotakt-claude-dashboard/actions/workflows/pruefung.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/tests-63-3DDC84" alt="63 tests">
+  <img src="https://img.shields.io/badge/tests-75-3DDC84" alt="75 tests">
   <img src="https://img.shields.io/badge/dependencies-none-5B8DEF" alt="no dependencies">
   <img src="https://img.shields.io/badge/python-3.9%20%7C%203.11%20%7C%203.13-C084FC" alt="Python">
   <img src="https://img.shields.io/badge/platform-macOS-9AA5BF" alt="macOS">
